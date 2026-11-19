@@ -85,13 +85,13 @@ class ScreenCaptureService : Service() {
             val state = recognizer.recognize(bitmap)
             
             if (state == null) {
-                OverlayService.updateTip("状态为空")
+                OverlayService.updateTip("状态为空", emptyList())
                 return
             }
 
             if (state.myHand.isEmpty()) {
-                // 直接把 Debug 数据显示在屏幕上
-                OverlayService.updateTip("未识别到手牌\n${state.debugInfo}")
+                // 把识别到的框传过去，即使手牌为空，也要把框画出来看看它到底认出了啥
+                OverlayService.updateTip("未识别到手牌\n${state.debugInfo}", state.boxes)
                 return
             }
 
@@ -99,10 +99,11 @@ class ScreenCaptureService : Service() {
             val suggestion = ActionDecoder.suggest(state, q)
             val modelNote = if (engine.hasModel()) "" else "（启发式）"
             
-            OverlayService.updateTip("$modelNote${suggestion.action} (识别到${state.myHand.size}张)")
+            // 把成功的提示和红框一起传给悬浮窗
+            OverlayService.updateTip("$modelNote${suggestion.action} (识别到${state.myHand.size}张)", state.boxes)
             
         } catch (e: Exception) {
-            OverlayService.updateTip("报错: ${e.message}")
+            OverlayService.updateTip("报错: ${e.message}", emptyList())
         } finally {
             image.close()
         }
