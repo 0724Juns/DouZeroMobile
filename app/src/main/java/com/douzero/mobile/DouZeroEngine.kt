@@ -24,22 +24,142 @@ interface CardRecognizer {
     fun recognize(screen: Bitmap): GameState?
 }
 
-class MockCardRecognizer : CardRecognizer {
+// ================= 视觉识别模块 =================
+class YoloCardRecognizer(context: Context) : CardRecognizer {
+    private val env = OrtEnvironment.getEnvironment()
+    private var session: OrtSession? = null
+    private val inputSize = 960 // yolov11n960 的输入尺寸
+
+    // 类别映射：0-12 是 3到2，13是小王，14是大王
+    // 假设模型训练时的类别顺序就是标准的牌面顺序
+
+    init {
+        try {
+            // 注意：这里必须换成你上传的 .onnx 文件准确名字！
+            val modelName = "best.onnx" 
+            val f = File(context.filesDir, modelName)
+            if (!f.exists()) {
+                context.assets.open(modelName).use { input ->
+                    f.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+            session = env.createSession(f.absolutePath, OrtSession.SessionOptions())
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     override fun recognize(screen: Bitmap): GameState? {
-        val hand = mutableListOf<Int>()
-        repeat(2) { hand.add(0) }
-        for (v in 1..12) hand.add(v)
-        hand.add(13)
-        return GameState(
-            myRole = Role.LANDLORD,
-            myHand = hand,
-            lastMoves = listOf(emptyList(), listOf(1), emptyList()),
-            otherCardCounts = listOf(10, 12),
-            bombCount = 0
-        )
+        val s = session ?: return null
+
+        try {
+            // 1. 图像预处理：缩放到 960x960，并转为 FloatBuffer
+            val resized = Bitmap.createScaledBitmap(screen, inputSize, inputSize, true)
+            val inputBuffer = convertBitmapToFloatBuffer(resized)
+
+            // 2. 构建输入张量 (1, 3, 960, 960)
+            val inputTensor = OnnxTensor.createTensor(
+                env, inputBuffer,
+                longArrayOf(1, 3, inputSize.toLong(), inputSize.toLong())
+            )
+            
+            // 注意：YOLOv11 的输入名字通常是 "images" 或者 "input"
+            val inputs = mapOf("images" to inputTensor)
+            val result = s.run(inputs)
+            val output = result.get(0) as OnnxTensor
+            val outputArray = output.floatBuffer.array()
+            result.close()
+            inputTensor.close()
+
+            // 3. 解析 YOLO 输出并提取手牌 (这是一个简化版的解析逻辑，真实场景下需要 NMS)
+            // YOLOv11 的输出通常是 [1, 4+15, 18900] (cx, cy, w, h + 15个类别的概率)
+            // 这里的解析非常复杂，如果解析不对，手牌可能就是空的。
+            
+            // 【重点】由于没有现成的 NMS (非极大值抑制) 代码，我们用个取巧的办法：
+            // 我们只统计屏幕下方 30% 区域内的检测框（假设为手牌）
+            val myHand = mutableListOf<Int>()
+            val screenHeightThreshold = screen.height * 0.7f // 屏幕下方 30%
+
+            // 假设输出格式是 [1, 19, 18900] (YOLOv11 常见格式)
+            val numClasses = 15
+            val numBoxes = 18900
+            val elementsPerBox = 4 + numClasses
+
+            for (i in 0 until numBoxes) {
+                // 找出这个框的 15 个类别的最大概率和对应类别
+                var maxProb = 0f
+                var classId = -1
+                for (c in 0 until numClasses) {
+                    val prob = outputArray[(4 + c) * numBoxes + i]
+                    if (prob > maxProb) {
+                        maxProb = prob
+                        classId = c
+                    }
+                }
+
+                // 如果概率大于 0.5，且类别有效
+                if (maxProb > 0.5f && classId != -1) {
+                    // 获取框的 Y 坐标 (cy)
+                    val cy = outputArray[1 * numBoxes + i]
+                    // 将 Y 坐标还原到屏幕分辨率
+                    val realY = cy * screen.height 
+
+                    // 如果在屏幕下方区域，算作手牌
+                    if (realY > screenHeightThreshold) {
+                        myHand.add(classId)
+                    }
+                }
+            }
+
+            if (myHand.isEmpty()) return null
+
+            // 4. 组装 GameState（暂时忽略上家出牌和叫地主按钮，只让 AI 算手牌）
+            return GameState(
+                myRole = Role.LANDLORD,
+                myHand = myHand,
+                lastMoves = listOf(emptyList(), emptyList(), emptyList()), // 暂不识别出牌
+                otherCardCounts = listOf(17, 17), // 假的剩余牌数
+                bombCount = 0
+            )
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return null
+        }
+    }
+
+    // 将 Bitmap 转换为 FloatBuffer (YOLO 预处理)
+    private fun convertBitmapToFloatBuffer(bitmap: Bitmap): FloatBuffer {
+        val width = bitmap.width
+        val height = bitmap.height
+        val floatBuffer = FloatBuffer.allocate(3 * width * height)
+
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        // YOLO 的输入通常需要归一化到 0-1，并且按照 R, G, B 通道排列 (NCHW)
+        val rChannel = FloatArray(width * height)
+        val gChannel = FloatArray(width * height)
+        val bChannel = FloatArray(width * height)
+
+        for (i in pixels.indices) {
+            val p = pixels[i]
+            rChannel[i] = ((p shr 16 and 0xFF) / 255.0f)
+            gChannel[i] = ((p shr 8 and 0xFF) / 255.0f)
+            bChannel[i] = ((p and 0xFF) / 255.0f)
+        }
+
+        floatBuffer.put(rChannel)
+        floatBuffer.put(gChannel)
+        floatBuffer.put(bChannel)
+        floatBuffer.rewind()
+        return floatBuffer
     }
 }
 
+// ================= 算牌模型模块 =================
 class DouZeroEngine(context: Context) {
 
     private val env = OrtEnvironment.getEnvironment()
@@ -48,12 +168,11 @@ class DouZeroEngine(context: Context) {
     init {
         listOf(
             Role.LANDLORD to "landlord.onnx",
-            Role.LANDLORD_UP to "landler_up.onnx",     // 已适配你的文件名
-            Role.LANDLORD_DOWN to "landler_down.onnx"  // 已适配你的文件名
+            Role.LANDLORD_UP to "landler_up.onnx",     
+            Role.LANDLORD_DOWN to "landler_down.onnx"  
         ).forEach { (role, name) ->
             try {
                 val f = File(context.filesDir, name)
-                // 如果手机内存里没有，就把 assets 里的模型复制过去
                 if (!f.exists()) {
                     context.assets.open(name).use { input ->
                         f.outputStream().use { output ->
@@ -61,7 +180,6 @@ class DouZeroEngine(context: Context) {
                         }
                     }
                 }
-                // 加载模型
                 sessions[role] = env.createSession(f.absolutePath, OrtSession.SessionOptions())
             } catch (e: Exception) {
                 e.printStackTrace() 
