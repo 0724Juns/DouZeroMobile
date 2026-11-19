@@ -3,7 +3,6 @@ package com.douzero.mobile
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
-import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.graphics.Bitmap
 import java.io.File
@@ -30,26 +29,18 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
     private val env = OrtEnvironment.getEnvironment()
     private var session: OrtSession? = null
     private var loadError: String = "未知错误"
-    private var inputWidth = 640
-    private var inputHeight = 640
+    // 【修改】强制写死宽高，满足它的长方形癖好
+    private val inputWidth = 960
+    private val inputHeight = 608
 
     init {
         try {
-            // 【关键修复】：强制清理手机里的旧模型缓存，每次都重新从 assets 读
+            // 每次强制删除旧缓存
             val f = File(context.filesDir, "best.onnx")
             if (f.exists()) { f.delete() }
             
             val modelBytes = context.assets.open("best.onnx").readBytes()
             session = env.createSession(modelBytes, OrtSession.SessionOptions())
-            
-            // 【自动探测】：读取模型真正想要的尺寸
-            val inputName = session!!.inputNames.iterator().next()
-            val tensorInfo = session!!.inputInfo[inputName] as TensorInfo
-            val shape = tensorInfo.shape
-            if (shape.size == 4) {
-                inputHeight = shape[2].toInt()
-                inputWidth = shape[3].toInt()
-            }
         } catch (e: Exception) {
             loadError = e.message ?: "文件读取失败"
         }
@@ -59,10 +50,11 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
         val s = session ?: return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "报错:$loadError")
         
         try {
-            // 使用自动探测到的尺寸进行缩放
+            // 缩放成 960x608 的长方形
             val resized = Bitmap.createScaledBitmap(screen, inputWidth, inputHeight, true)
             val inputBuffer = convertBitmapToFloatBuffer(resized)
 
+            // 张量尺寸也要匹配 (1, 3, 高, 宽)
             val inputTensor = OnnxTensor.createTensor(
                 env, inputBuffer,
                 longArrayOf(1, 3, inputHeight.toLong(), inputWidth.toLong())
@@ -129,8 +121,7 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
                 }
             }
 
-            // 加上尺寸提示，方便我们观察
-            val debugStr = "尺寸:${inputWidth}x${inputHeight} 最高概率:${String.format("%.2f", maxConfOverall)}"
+            val debugStr = "最高概率:${String.format("%.2f", maxConfOverall)}"
 
             if (myHand.isEmpty()) {
                 return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = debugStr)
