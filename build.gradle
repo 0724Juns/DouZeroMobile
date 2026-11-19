@@ -1,4 +1,4 @@
 plugins {
-    id "com.android.application"的使用者可以使用版本'8.2.2' apply false
-    id 'org.jetbrains.kotlin.android'版本'1.9.22' apply false
+    id 'com.android.application' version '8.2.2' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
 }
