@@ -8,8 +8,8 @@ android {
         applicationId "com.douzero.mobile"
         minSdk 26
         targetSdk 34
-        versionCode 2       // 版本号加1
-        versionName "1.3"
+        versionCode 2
+        versionName "1.0"
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -21,6 +21,6 @@ android {
 dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
-    // 升级了这里：
-    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.18.0'
+    // 退回最稳的 1.17.0
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.0'
 }
