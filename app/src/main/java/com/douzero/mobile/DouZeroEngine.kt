@@ -10,6 +10,7 @@ import java.nio.FloatBuffer
 
 enum class Role { LANDLORD, LANDLORD_UP, LANDLORD_DOWN }
 
+// 增加 debugInfo 字段，方便把识别过程传出来
 data class GameState(
     val myRole: Role,
     val myHand: List<Int>,
@@ -17,44 +18,36 @@ data class GameState(
     val otherCardCounts: List<Int>,
     val bombCount: Int,
     val isLandlordTurnToCall: Boolean = false,
-    val isDoublingPhase: Boolean = false
+    val isDoublingPhase: Boolean = false,
+    val debugInfo: String = ""
 )
 
 interface CardRecognizer {
     fun recognize(screen: Bitmap): GameState?
 }
 
-// ================= 视觉识别模块（带诊断） =================
 class YoloCardRecognizer(context: Context) : CardRecognizer {
     private val env = OrtEnvironment.getEnvironment()
     private var session: OrtSession? = null
-    private var initError: String? = null
     private val inputSize = 960 
 
     init {
         try {
-            // ⚠️ 注意：这里必须换成你上传的 .onnx 文件准确名字！
-            val modelName = "best.onnx" 
+            val modelName = "best.onnx" // 请确保文件名一致
             val f = File(context.filesDir, modelName)
             if (!f.exists()) {
                 context.assets.open(modelName).use { input ->
-                    f.outputStream().use { output ->
-                        input.copyTo(output)
-                    }
+                    f.outputStream().use { output -> input.copyTo(output) }
                 }
             }
             session = env.createSession(f.absolutePath, OrtSession.SessionOptions())
-        } catch (e: Exception) {
-            initError = "加载YOLO失败: ${e.message}"
-        }
+        } catch (e: Exception) { }
     }
 
     override fun recognize(screen: Bitmap): GameState? {
-        // 如果初始化失败，直接返回 null
-        val s = session ?: return null
+        val s = session ?: return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "模型未加载")
 
         try {
-            // 1. 图像预处理
             val resized = Bitmap.createScaledBitmap(screen, inputSize, inputSize, true)
             val inputBuffer = convertBitmapToFloatBuffer(resized)
 
@@ -63,16 +56,11 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
                 longArrayOf(1, 3, inputSize.toLong(), inputSize.toLong())
             )
             
-            // 动态获取模型的输入名字
             val inputName = s.inputNames.iterator().next()
             val inputs = mapOf(inputName to inputTensor)
-            
             val result = s.run(inputs)
-            
-            // 修复：直接用索引 0 获取输出，避免类型错误
             val output = result.get(0) as OnnxTensor
             
-            // 打印输出维度，方便我们分析
             val shape = output.info.shape
             val shapeStr = shape.joinToString(",")
             val outputArray = output.floatBuffer.array()
@@ -81,9 +69,7 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
 
             val myHand = mutableListOf<Int>()
             
-            if (shape.size != 3) {
-                return null // 维度不对，直接跳过
-            }
+            if (shape.size != 3) return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "维度异常:$shapeStr")
 
             val dim1 = shape[1].toInt()
             val dim2 = shape[2].toInt()
@@ -99,10 +85,12 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
                 numBoxes = dim1
                 isChannelFirst = false
             } else {
-                 return null // 无法识别维度，跳过
+                 return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "无法识别维度:$shapeStr")
             }
 
             val screenHeightThreshold = screen.height * 0.6f 
+            var maxConfOverall = 0f // 记录全场最高置信度
+            var highestY = 0f
 
             for (i in 0 until numBoxes) {
                 var maxProb = 0f
@@ -117,9 +105,14 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
                     }
                 }
 
-                if (maxProb > 0.4f && classId != -1) {
+                if (maxProb > maxConfOverall) maxConfOverall = maxProb
+
+                // 放宽阈值到 0.1 试试
+                if (maxProb > 0.1f && classId != -1) {
                     val cyIndex = if (isChannelFirst) 1 * numBoxes + i else i * (4 + numClasses) + 1
                     val cy = outputArray[cyIndex]
+                    if (cy > highestY) highestY = cy
+                    
                     val realY = cy * screen.height 
 
                     if (realY > screenHeightThreshold) {
@@ -128,9 +121,11 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
                 }
             }
 
-            // 修复：找不到牌直接返回 null，不抛出异常
+            val debugStr = "维度:$shapeStr 最高概率:${String.format("%.2f", maxConfOverall)} 最低Y:${String.format("%.2f", highestY)}"
+
             if (myHand.isEmpty()) {
-                return null
+                // 如果没找到，把 debug 信息传出去
+                return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = debugStr)
             }
 
             return GameState(
@@ -138,11 +133,11 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
                 myHand = myHand,
                 lastMoves = listOf(emptyList(), emptyList(), emptyList()), 
                 otherCardCounts = listOf(17, 17), 
-                bombCount = 0
+                bombCount = 0,
+                debugInfo = "识别成功"
             )
         } catch (e: Exception) {
-            e.printStackTrace()
-            return null
+            return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "报错:${e.message}")
         }
     }
 
@@ -150,7 +145,6 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
         val width = bitmap.width
         val height = bitmap.height
         val floatBuffer = FloatBuffer.allocate(3 * width * height)
-
         val pixels = IntArray(width * height)
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
@@ -160,11 +154,11 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
 
         for (i in pixels.indices) {
             val p = pixels[i]
-            rChannel[i] = (p shr 16 and 0xFF).toFloat()
-            gChannel[i] = (p shr 8 and 0xFF).toFloat()
-            bChannel[i] = (p and 0xFF).toFloat()
+            // 改回 0~1 归一化（这是大多数YOLO的标准）
+            rChannel[i] = ((p shr 16 and 0xFF) / 255.0f)
+            gChannel[i] = ((p shr 8 and 0xFF) / 255.0f)
+            bChannel[i] = ((p and 0xFF) / 255.0f)
         }
-
         floatBuffer.put(rChannel)
         floatBuffer.put(gChannel)
         floatBuffer.put(bChannel)
@@ -173,7 +167,6 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
     }
 }
 
-// ================= 算牌模型模块（不变） =================
 class DouZeroEngine(context: Context) {
     private val env = OrtEnvironment.getEnvironment()
     private val sessions = mutableMapOf<Role, OrtSession>()
