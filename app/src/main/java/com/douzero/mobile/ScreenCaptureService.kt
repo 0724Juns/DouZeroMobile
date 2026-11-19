@@ -49,7 +49,6 @@ class ScreenCaptureService : Service() {
 
         val metrics = DisplayMetrics()
         (getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getMetrics(metrics)
-        // 这里会获取你手机的高清分辨率（比如 1260x2800）
         val w = metrics.widthPixels
         val h = metrics.heightPixels
 
@@ -60,9 +59,9 @@ class ScreenCaptureService : Service() {
             imageReader.surface, null, handler
         )
 
-        // 初始化视觉识别器（传入 applicationContext 用于加载 YOLO 模型）
         recognizer = YoloCardRecognizer(applicationContext)
         engine = DouZeroEngine(applicationContext)
+        
         running = true
         loop()
         return START_STICKY
@@ -73,7 +72,7 @@ class ScreenCaptureService : Service() {
         handler.postDelayed({
             captureAndInfer()
             loop()
-        }, 1500) // 稍微放慢一点，每 1.5 秒识别一次，给手机喘息的时间
+        }, 1500) 
     }
 
     private fun captureAndInfer() {
@@ -83,28 +82,27 @@ class ScreenCaptureService : Service() {
             val bitmap = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
             bitmap.copyPixelsFromBuffer(buffer)
 
-            // 1. 眼睛看（YOLO 识别）
             val state = recognizer.recognize(bitmap)
             
             if (state == null) {
-                OverlayService.updateTip("未识别到手牌...")
+                OverlayService.updateTip("状态为空")
                 return
             }
 
-            // 2. 脑子算（DouZero 推理）
+            if (state.myHand.isEmpty()) {
+                // 直接把 Debug 数据显示在屏幕上
+                OverlayService.updateTip("未识别到手牌\n${state.debugInfo}")
+                return
+            }
+
             val q = engine.infer(state)
-            
-            // 3. 嘴巴说（把结果输出到悬浮窗）
             val suggestion = ActionDecoder.suggest(state, q)
-            
             val modelNote = if (engine.hasModel()) "" else "（启发式）"
             
-            // 显示 AI 的计算结果，同时把识别到的手牌数量也显示出来，方便你调试
             OverlayService.updateTip("$modelNote${suggestion.action} (识别到${state.myHand.size}张)")
             
         } catch (e: Exception) {
-            e.printStackTrace()
-            OverlayService.updateTip("出错: ${e.message}")
+            OverlayService.updateTip("报错: ${e.message}")
         } finally {
             image.close()
         }
