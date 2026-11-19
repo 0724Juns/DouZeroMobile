@@ -89,24 +89,37 @@ class ScreenCaptureService : Service() {
                 return
             }
 
+            // 无论有没有识别到，都把牌的序号转成名称
+            val handNames = state.myHand.map { cardName(it) }.joinToString(" ")
+
             if (state.myHand.isEmpty()) {
-                // 把识别到的框传过去，即使手牌为空，也要把框画出来看看它到底认出了啥
                 OverlayService.updateTip("未识别到手牌\n${state.debugInfo}", state.boxes)
                 return
             }
 
             val q = engine.infer(state)
             val suggestion = ActionDecoder.suggest(state, q)
-            val modelNote = if (engine.hasModel()) "" else "（启发式）"
             
-            // 把成功的提示和红框一起传给悬浮窗
-            OverlayService.updateTip("$modelNote${suggestion.action} (识别到${state.myHand.size}张)", state.boxes)
+            // 如果 AI 大脑没加载出来，提示一下
+            val modelNote = if (engine.hasModel()) "" else "（未加载AI，启发式）"
+            
+            // 【终极展示】：把手牌铺开，下面跟上建议
+            val showText = "手牌: $handNames\n建议: $modelNote${suggestion.action}"
+            OverlayService.updateTip(showText, state.boxes)
             
         } catch (e: Exception) {
             OverlayService.updateTip("报错: ${e.message}", emptyList())
         } finally {
             image.close()
         }
+    }
+
+    // 牌面翻译器
+    private fun cardName(v: Int): String = when (v) {
+        0 -> "3"; 1 -> "4"; 2 -> "5"; 3 -> "6"; 4 -> "7"
+        5 -> "8"; 6 -> "9"; 7 -> "10"; 8 -> "J"; 9 -> "Q"
+        10 -> "K"; 11 -> "A"; 12 -> "2"; 13 -> "小王"; 14 -> "大王"
+        else -> "?"
     }
 
     private fun createNotificationChannel() {
