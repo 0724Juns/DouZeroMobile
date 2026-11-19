@@ -6,11 +6,21 @@ import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
 import java.io.File
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.exp
 
 enum class Role { LANDLORD, LANDLORD_UP, LANDLORD_DOWN }
+
+// 增加一个数据类，用来保存画框的坐标
+data class BoundingBox(
+    val x: Float,
+    val y: Float,
+    val w: Float,
+    val h: Float,
+    val label: String
+)
 
 data class GameState(
     val myRole: Role,
@@ -20,7 +30,8 @@ data class GameState(
     val bombCount: Int,
     val isLandlordTurnToCall: Boolean = false,
     val isDoublingPhase: Boolean = false,
-    val debugInfo: String = ""
+    val debugInfo: String = "",
+    val boxes: List<BoundingBox> = emptyList() // 新增：保存要画的框
 )
 
 interface CardRecognizer {
@@ -49,34 +60,26 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
         val s = session ?: return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "报错:$loadError")
         
         try {
-            // 全屏压缩到 960x608
             val resized = Bitmap.createScaledBitmap(screen, inputWidth, inputHeight, true)
-            
-            // 【关键修改】：提供两种数据，试探模型胃口
-            // 1. 0~1 归一化 (RGB)
-            val bufferNormalized = convertBitmapToFloatBuffer(resized, normalize = true)
-            val tensorNormalized = OnnxTensor.createTensor(env, bufferNormalized, longArrayOf(1, 3, inputHeight.toLong(), inputWidth.toLong()))
-            
-            // 2. 0~255 原值 (RGB)
-            val bufferRaw = convertBitmapToFloatBuffer(resized, normalize = false)
-            val tensorRaw = OnnxTensor.createTensor(env, bufferRaw, longArrayOf(1, 3, inputHeight.toLong(), inputWidth.toLong()))
+            val inputBuffer = convertBitmapToFloatBuffer(resized, normalize = true)
+
+            val inputTensor = OnnxTensor.createTensor(
+                env, inputBuffer,
+                longArrayOf(1, 3, inputHeight.toLong(), inputWidth.toLong())
+            )
             
             val inputName = s.inputNames.iterator().next()
-            
-            var maxConfOverall = -999f
-            
-            // 先试归一化版
-            var result = s.run(mapOf(inputName to tensorNormalized))
-            var output = result.get(0) as OnnxTensor
-            var outputArray = output.floatBuffer.array()
-            var shape = output.info.shape
+            val result = s.run(mapOf(inputName to inputTensor))
+            val output = result.get(0) as OnnxTensor
+            val shape = output.info.shape
+            val outputArray = output.floatBuffer.array()
             result.close()
-            tensorNormalized.close()
+            inputTensor.close()
 
-            var dim1 = shape[1].toInt()
-            var dim2 = shape[2].toInt()
-            
-            // YOLOv11/v8 通常没有 objectness，输出通常是 4个坐标 + 15个类别 = 19
+            if (shape.size != 3) return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "维度异常:$shape")
+
+            val dim1 = shape[1].toInt()
+            val dim2 = shape[2].toInt()
             val numClasses = 15
             var numBoxes = 0
             var isChannelFirst = true
@@ -88,78 +91,99 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
                 numBoxes = dim1
                 isChannelFirst = false
             } else {
-                 return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "维度异常:$shape")
+                 return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "无法识别维度:$shape")
             }
 
-            // 遍历找最高分
-            for (i in 0 until numBoxes) {
-                for (c in 0 until numClasses) {
-                    val probIndex = if (isChannelFirst) (4 + c) * numBoxes + i else i * (4 + numClasses) + (4 + c)
-                    val prob = outputArray[probIndex]
-                    if (prob > maxConfOverall) maxConfOverall = prob
-                }
-            }
-            
-            // 如果归一化没结果，试试 0~255 原值版
-            if (maxConfOverall < 0.1f) {
-                result = s.run(mapOf(inputName to tensorRaw))
-                output = result.get(0) as OnnxTensor
-                outputArray = output.floatBuffer.array()
-                shape = output.info.shape
-                result.close()
-                
-                maxConfOverall = -999f
-                for (i in 0 until numBoxes) {
-                    for (c in 0 until numClasses) {
-                        val probIndex = if (isChannelFirst) (4 + c) * numBoxes + i else i * (4 + numClasses) + (4 + c)
-                        val prob = outputArray[probIndex]
-                        if (prob > maxConfOverall) maxConfOverall = prob
-                    }
-                }
-            }
-            tensorRaw.close()
+            // 存储所有候选框
+            data class TempBox(val cx: Float, val cy: Float, val w: Float, val h: Float, val conf: Float, val classId: Int)
+            val candidates = mutableListOf<TempBox>()
 
-            val debugStr = "最高分:${String.format("%.2f", maxConfOverall)}"
-
-            // 如果还是极低，说明模型彻底不认识这个画面
-            if (maxConfOverall < 0.1f) {
-                return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = debugStr)
-            }
-
-            // 如果分数正常，我们再做真正的 NMS 筛选出牌
-            val myHand = mutableListOf<Int>()
             for (i in 0 until numBoxes) {
                 var maxProb = -999f
                 var classId = -1
                 
                 for (c in 0 until numClasses) {
                     val probIndex = if (isChannelFirst) (4 + c) * numBoxes + i else i * (4 + numClasses) + (4 + c)
-                    val prob = outputArray[probIndex]
+                    var prob = outputArray[probIndex]
+                    // 如果有负数，说明没做 Sigmoid，手动激活一下
+                    if (prob < 0f || prob > 1f) prob = 1f / (1f + exp(-prob))
+                    
                     if (prob > maxProb) {
                         maxProb = prob
                         classId = c
                     }
                 }
 
-                // 阈值设定为 0.3
-                if (maxProb > 0.3f && classId != -1) {
+                if (maxProb > 0.25f) {
+                    val cxIndex = if (isChannelFirst) 0 * numBoxes + i else i * (4 + numClasses) + 0
                     val cyIndex = if (isChannelFirst) 1 * numBoxes + i else i * (4 + numClasses) + 1
-                    val cy = outputArray[cyIndex]
-                    // 还原 Y 坐标（因为全屏压缩了，所以把比例乘回去）
-                    val realY = cy * screen.height 
+                    val wIndex = if (isChannelFirst) 2 * numBoxes + i else i * (4 + numClasses) + 2
+                    val hIndex = if (isChannelFirst) 3 * numBoxes + i else i * (4 + numClasses) + 3
                     
-                    // 【这里依然先只取底部的牌】
-                    if (realY > screen.height * 0.5f) {
-                        myHand.add(classId)
-                    }
+                    candidates.add(TempBox(
+                        outputArray[cxIndex], outputArray[cyIndex], 
+                        outputArray[wIndex], outputArray[hIndex], 
+                        maxProb, classId
+                    ))
                 }
             }
 
-            if (myHand.isEmpty()) {
-                return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = debugStr)
+            // 执行 NMS (非极大值抑制) 去重
+            val finalBoxes = mutableListOf<BoundingBox>()
+            val myHand = mutableListOf<Int>()
+            candidates.sortByDescending { it.conf }
+            
+            val selected = mutableListOf<TempBox>()
+            for (cand in candidates) {
+                var keep = true
+                for (sel in selected) {
+                    // 计算 IoU (重叠度)
+                    val x1 = max(cand.cx - cand.w/2, sel.cx - sel.w/2)
+                    val y1 = max(cand.cy - cand.h/2, sel.cy - sel.h/2)
+                    val x2 = min(cand.cx + cand.w/2, sel.cx + sel.w/2)
+                    val y2 = min(cand.cy + cand.h/2, sel.cy + sel.h/2)
+                    val intersection = max(0f, x2 - x1) * max(0f, y2 - y1)
+                    val area1 = cand.w * cand.h
+                    val area2 = sel.w * sel.h
+                    val iou = intersection / (area1 + area2 - intersection)
+                    
+                    if (iou > 0.45f) {
+                        keep = false
+                        break
+                    }
+                }
+                if (keep) selected.add(cand)
             }
 
-            return GameState(Role.LANDLORD, myHand, listOf(emptyList(), emptyList(), emptyList()), listOf(17, 17), 0, debugInfo = "识别成功:${myHand.size}张")
+            val cardNames = listOf("3","4","5","6","7","8","9","10","J","Q","K","A","2","小王","大王")
+
+            for (box in selected) {
+                // 坐标还原到屏幕尺寸
+                val realX = (box.cx - box.w/2) * screen.width
+                val realY = (box.cy - box.h/2) * screen.height
+                val realW = box.w * screen.width
+                val realH = box.h * screen.height
+                
+                val labelName = cardNames.getOrElse(box.classId) { "?" }
+                finalBoxes.add(BoundingBox(realX, realY, realW, realH, labelName))
+                
+                // 如果这个框在屏幕下方 (Y > 屏幕高度的一半)，认为是手牌
+                if (box.cy > 0.5f) {
+                    myHand.add(box.classId)
+                }
+            }
+
+            val debugStr = "找到${finalBoxes.size}张牌"
+
+            if (myHand.isEmpty() && finalBoxes.isEmpty()) {
+                return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "没找到牌")
+            }
+
+            return GameState(
+                Role.LANDLORD, myHand, 
+                listOf(emptyList(), emptyList(), emptyList()), 
+                listOf(17, 17), 0, debugInfo = debugStr, boxes = finalBoxes
+            )
         } catch (e: Exception) {
             return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "推理错:${e.message}")
         }
@@ -191,7 +215,7 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
     }
 }
 
-// 剩下的 DouZeroEngine 和 ActionDecoder 保持原样，不需要动。
+// DouZeroEngine 和 ActionDecoder 保持不变
 class DouZeroEngine(private val context: Context) {
     private val env = OrtEnvironment.getEnvironment()
     private val sessions = mutableMapOf<Role, OrtSession>()
