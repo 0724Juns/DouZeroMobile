@@ -28,7 +28,7 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
     private val env = OrtEnvironment.getEnvironment()
     private var session: OrtSession? = null
     private var loadError: String = "未知错误"
-    private val inputSize = 608 // 【关键修改】：把 960 改成了 608
+    private val inputSize = 960 // 【关键修改】：把 960 改成了 608
 
     init {
         try {
