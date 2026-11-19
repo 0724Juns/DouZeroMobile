@@ -6,6 +6,8 @@ import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
 
 enum class Role { LANDLORD, LANDLORD_UP, LANDLORD_DOWN }
@@ -29,16 +31,13 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
     private val env = OrtEnvironment.getEnvironment()
     private var session: OrtSession? = null
     private var loadError: String = "未知错误"
-    // 【修改】强制写死宽高，满足它的长方形癖好
     private val inputWidth = 960
     private val inputHeight = 608
 
     init {
         try {
-            // 每次强制删除旧缓存
             val f = File(context.filesDir, "best.onnx")
             if (f.exists()) { f.delete() }
-            
             val modelBytes = context.assets.open("best.onnx").readBytes()
             session = env.createSession(modelBytes, OrtSession.SessionOptions())
         } catch (e: Exception) {
@@ -50,34 +49,34 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
         val s = session ?: return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "报错:$loadError")
         
         try {
-            // 缩放成 960x608 的长方形
+            // 全屏压缩到 960x608
             val resized = Bitmap.createScaledBitmap(screen, inputWidth, inputHeight, true)
-            val inputBuffer = convertBitmapToFloatBuffer(resized)
-
-            // 张量尺寸也要匹配 (1, 3, 高, 宽)
-            val inputTensor = OnnxTensor.createTensor(
-                env, inputBuffer,
-                longArrayOf(1, 3, inputHeight.toLong(), inputWidth.toLong())
-            )
+            
+            // 【关键修改】：提供两种数据，试探模型胃口
+            // 1. 0~1 归一化 (RGB)
+            val bufferNormalized = convertBitmapToFloatBuffer(resized, normalize = true)
+            val tensorNormalized = OnnxTensor.createTensor(env, bufferNormalized, longArrayOf(1, 3, inputHeight.toLong(), inputWidth.toLong()))
+            
+            // 2. 0~255 原值 (RGB)
+            val bufferRaw = convertBitmapToFloatBuffer(resized, normalize = false)
+            val tensorRaw = OnnxTensor.createTensor(env, bufferRaw, longArrayOf(1, 3, inputHeight.toLong(), inputWidth.toLong()))
             
             val inputName = s.inputNames.iterator().next()
-            val inputs = mapOf(inputName to inputTensor)
-            val result = s.run(inputs)
-            val output = result.get(0) as OnnxTensor
             
-            val shape = output.info.shape
-            val shapeStr = shape.joinToString(",")
-            val outputArray = output.floatBuffer.array()
+            var maxConfOverall = -999f
+            
+            // 先试归一化版
+            var result = s.run(mapOf(inputName to tensorNormalized))
+            var output = result.get(0) as OnnxTensor
+            var outputArray = output.floatBuffer.array()
+            var shape = output.info.shape
             result.close()
-            inputTensor.close()
+            tensorNormalized.close()
 
-            val myHand = mutableListOf<Int>()
+            var dim1 = shape[1].toInt()
+            var dim2 = shape[2].toInt()
             
-            if (shape.size != 3) return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "维度异常:$shapeStr")
-
-            val dim1 = shape[1].toInt()
-            val dim2 = shape[2].toInt()
-            
+            // YOLOv11/v8 通常没有 objectness，输出通常是 4个坐标 + 15个类别 = 19
             val numClasses = 15
             var numBoxes = 0
             var isChannelFirst = true
@@ -89,14 +88,48 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
                 numBoxes = dim1
                 isChannelFirst = false
             } else {
-                 return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "无法识别维度:$shapeStr")
+                 return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "维度异常:$shape")
             }
 
-            val screenHeightThreshold = screen.height * 0.6f 
-            var maxConfOverall = 0f
-
+            // 遍历找最高分
             for (i in 0 until numBoxes) {
-                var maxProb = 0f
+                for (c in 0 until numClasses) {
+                    val probIndex = if (isChannelFirst) (4 + c) * numBoxes + i else i * (4 + numClasses) + (4 + c)
+                    val prob = outputArray[probIndex]
+                    if (prob > maxConfOverall) maxConfOverall = prob
+                }
+            }
+            
+            // 如果归一化没结果，试试 0~255 原值版
+            if (maxConfOverall < 0.1f) {
+                result = s.run(mapOf(inputName to tensorRaw))
+                output = result.get(0) as OnnxTensor
+                outputArray = output.floatBuffer.array()
+                shape = output.info.shape
+                result.close()
+                
+                maxConfOverall = -999f
+                for (i in 0 until numBoxes) {
+                    for (c in 0 until numClasses) {
+                        val probIndex = if (isChannelFirst) (4 + c) * numBoxes + i else i * (4 + numClasses) + (4 + c)
+                        val prob = outputArray[probIndex]
+                        if (prob > maxConfOverall) maxConfOverall = prob
+                    }
+                }
+            }
+            tensorRaw.close()
+
+            val debugStr = "最高分:${String.format("%.2f", maxConfOverall)}"
+
+            // 如果还是极低，说明模型彻底不认识这个画面
+            if (maxConfOverall < 0.1f) {
+                return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = debugStr)
+            }
+
+            // 如果分数正常，我们再做真正的 NMS 筛选出牌
+            val myHand = mutableListOf<Int>()
+            for (i in 0 until numBoxes) {
+                var maxProb = -999f
                 var classId = -1
                 
                 for (c in 0 until numClasses) {
@@ -108,32 +141,31 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
                     }
                 }
 
-                if (maxProb > maxConfOverall) maxConfOverall = maxProb
-
-                if (maxProb > 0.1f && classId != -1) {
+                // 阈值设定为 0.3
+                if (maxProb > 0.3f && classId != -1) {
                     val cyIndex = if (isChannelFirst) 1 * numBoxes + i else i * (4 + numClasses) + 1
                     val cy = outputArray[cyIndex]
+                    // 还原 Y 坐标（因为全屏压缩了，所以把比例乘回去）
                     val realY = cy * screen.height 
-
-                    if (realY > screenHeightThreshold) {
+                    
+                    // 【这里依然先只取底部的牌】
+                    if (realY > screen.height * 0.5f) {
                         myHand.add(classId)
                     }
                 }
             }
 
-            val debugStr = "最高概率:${String.format("%.2f", maxConfOverall)}"
-
             if (myHand.isEmpty()) {
                 return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = debugStr)
             }
 
-            return GameState(Role.LANDLORD, myHand, listOf(emptyList(), emptyList(), emptyList()), listOf(17, 17), 0, debugInfo = "识别成功")
+            return GameState(Role.LANDLORD, myHand, listOf(emptyList(), emptyList(), emptyList()), listOf(17, 17), 0, debugInfo = "识别成功:${myHand.size}张")
         } catch (e: Exception) {
             return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "推理错:${e.message}")
         }
     }
 
-    private fun convertBitmapToFloatBuffer(bitmap: Bitmap): FloatBuffer {
+    private fun convertBitmapToFloatBuffer(bitmap: Bitmap, normalize: Boolean): FloatBuffer {
         val width = bitmap.width
         val height = bitmap.height
         val floatBuffer = FloatBuffer.allocate(3 * width * height)
@@ -143,12 +175,13 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
         val rChannel = FloatArray(width * height)
         val gChannel = FloatArray(width * height)
         val bChannel = FloatArray(width * height)
+        val scale = if (normalize) 1.0f / 255.0f else 1.0f
 
         for (i in pixels.indices) {
             val p = pixels[i]
-            rChannel[i] = ((p shr 16 and 0xFF) / 255.0f)
-            gChannel[i] = ((p shr 8 and 0xFF) / 255.0f)
-            bChannel[i] = ((p and 0xFF) / 255.0f)
+            rChannel[i] = (p shr 16 and 0xFF) * scale
+            gChannel[i] = (p shr 8 and 0xFF) * scale
+            bChannel[i] = (p and 0xFF) * scale
         }
         floatBuffer.put(rChannel)
         floatBuffer.put(gChannel)
@@ -158,6 +191,7 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
     }
 }
 
+// 剩下的 DouZeroEngine 和 ActionDecoder 保持原样，不需要动。
 class DouZeroEngine(private val context: Context) {
     private val env = OrtEnvironment.getEnvironment()
     private val sessions = mutableMapOf<Role, OrtSession>()
