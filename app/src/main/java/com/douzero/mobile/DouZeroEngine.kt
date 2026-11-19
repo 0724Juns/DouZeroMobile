@@ -28,7 +28,7 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
     private val env = OrtEnvironment.getEnvironment()
     private var session: OrtSession? = null
     private var loadError: String = "未知错误"
-    private val inputSize = 960 
+    private val inputSize = 608 // 【关键修改】：把 960 改成了 608
 
     init {
         try {
@@ -43,6 +43,7 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
         val s = session ?: return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "报错:$loadError")
         
         try {
+            // 将屏幕缩放为 608x608
             val resized = Bitmap.createScaledBitmap(screen, inputSize, inputSize, true)
             val inputBuffer = convertBitmapToFloatBuffer(resized)
 
