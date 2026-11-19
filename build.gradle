@@ -1,7 +1,5 @@
-plugins {
-    id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
-}
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
 
 android {
     namespace 'com.douzero.mobile'
@@ -10,8 +8,8 @@ android {
         applicationId "com.douzero.mobile"
         minSdk 26
         targetSdk 34
-        versionCode 2          // 版本号变成2
-        versionName "1.1"      // 版本名变成1.1
+        versionCode 2
+        versionName "1.2"
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
