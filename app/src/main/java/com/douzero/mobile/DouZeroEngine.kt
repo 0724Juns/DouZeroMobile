@@ -48,15 +48,24 @@ class DouZeroEngine(context: Context) {
     init {
         listOf(
             Role.LANDLORD to "landlord.onnx",
-            Role.LANDLORD_UP to "landlord_up.onnx",
-            Role.LANDLORD_DOWN to "landlord_down.onnx"
+            Role.LANDLORD_UP to "landler_up.onnx",     // 已适配你的文件名
+            Role.LANDLORD_DOWN to "landler_down.onnx"  // 已适配你的文件名
         ).forEach { (role, name) ->
             try {
                 val f = File(context.filesDir, name)
-                if (f.exists()) {
-                    sessions[role] = env.createSession(f.absolutePath, OrtSession.SessionOptions())
+                // 如果手机内存里没有，就把 assets 里的模型复制过去
+                if (!f.exists()) {
+                    context.assets.open(name).use { input ->
+                        f.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
+                    }
                 }
-            } catch (_: Exception) { }
+                // 加载模型
+                sessions[role] = env.createSession(f.absolutePath, OrtSession.SessionOptions())
+            } catch (e: Exception) {
+                e.printStackTrace() 
+            }
         }
     }
 
