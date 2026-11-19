@@ -10,7 +10,6 @@ import java.nio.FloatBuffer
 
 enum class Role { LANDLORD, LANDLORD_UP, LANDLORD_DOWN }
 
-// 增加 debugInfo 字段，方便把识别过程传出来
 data class GameState(
     val myRole: Role,
     val myHand: List<Int>,
@@ -29,11 +28,12 @@ interface CardRecognizer {
 class YoloCardRecognizer(context: Context) : CardRecognizer {
     private val env = OrtEnvironment.getEnvironment()
     private var session: OrtSession? = null
+    private var loadError: String = "未知错误"
     private val inputSize = 960 
 
     init {
         try {
-            val modelName = "best.onnx" // 请确保文件名一致
+            val modelName = "best.onnx" 
             val f = File(context.filesDir, modelName)
             if (!f.exists()) {
                 context.assets.open(modelName).use { input ->
@@ -41,11 +41,19 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
                 }
             }
             session = env.createSession(f.absolutePath, OrtSession.SessionOptions())
-        } catch (e: Exception) { }
+        } catch (e: Exception) {
+            // 捕获详细错误
+            loadError = e.message ?: e.toString()
+        }
     }
 
     override fun recognize(screen: Bitmap): GameState? {
-        val s = session ?: return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "模型未加载")
+        // 如果加载失败，把具体原因传出去
+        if (session == null) {
+            return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "加载报错:$loadError")
+        }
+        
+        val s = session!!
 
         try {
             val resized = Bitmap.createScaledBitmap(screen, inputSize, inputSize, true)
@@ -89,8 +97,7 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
             }
 
             val screenHeightThreshold = screen.height * 0.6f 
-            var maxConfOverall = 0f // 记录全场最高置信度
-            var highestY = 0f
+            var maxConfOverall = 0f
 
             for (i in 0 until numBoxes) {
                 var maxProb = 0f
@@ -107,12 +114,9 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
 
                 if (maxProb > maxConfOverall) maxConfOverall = maxProb
 
-                // 放宽阈值到 0.1 试试
                 if (maxProb > 0.1f && classId != -1) {
                     val cyIndex = if (isChannelFirst) 1 * numBoxes + i else i * (4 + numClasses) + 1
                     val cy = outputArray[cyIndex]
-                    if (cy > highestY) highestY = cy
-                    
                     val realY = cy * screen.height 
 
                     if (realY > screenHeightThreshold) {
@@ -121,10 +125,9 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
                 }
             }
 
-            val debugStr = "维度:$shapeStr 最高概率:${String.format("%.2f", maxConfOverall)} 最低Y:${String.format("%.2f", highestY)}"
+            val debugStr = "维:$shapeStr 最高概率:${String.format("%.2f", maxConfOverall)}"
 
             if (myHand.isEmpty()) {
-                // 如果没找到，把 debug 信息传出去
                 return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = debugStr)
             }
 
@@ -137,7 +140,7 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
                 debugInfo = "识别成功"
             )
         } catch (e: Exception) {
-            return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "报错:${e.message}")
+            return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "推理报错:${e.message}")
         }
     }
 
@@ -154,7 +157,6 @@ class YoloCardRecognizer(context: Context) : CardRecognizer {
 
         for (i in pixels.indices) {
             val p = pixels[i]
-            // 改回 0~1 归一化（这是大多数YOLO的标准）
             rChannel[i] = ((p shr 16 and 0xFF) / 255.0f)
             gChannel[i] = ((p shr 8 and 0xFF) / 255.0f)
             bChannel[i] = ((p and 0xFF) / 255.0f)
