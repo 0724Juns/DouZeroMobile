@@ -33,6 +33,11 @@ interface CardRecognizer {
     fun recognize(screen: Bitmap): GameState?
 }
 
+// 把 TempBox 移到外面，避免编译器报错
+data class TempBox(
+    val cx: Float, val cy: Float, val w: Float, val h: Float, val conf: Float, val classId: Int
+)
+
 class YoloCardRecognizer(private val context: Context) : CardRecognizer {
     private val env = OrtEnvironment.getEnvironment()
     private var session: OrtSession? = null
@@ -89,7 +94,6 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
                  return GameState(Role.LANDLORD, emptyList(), emptyList(), emptyList(), 0, debugInfo = "无法识别维度:$shape")
             }
 
-            data class TempBox(val cx: Float, val cy: Float, val w: Float, val h: Float, val conf: Float, val classId: Int)
             val candidates = mutableListOf<TempBox>()
 
             for (i in 0 until numBoxes) {
@@ -107,7 +111,6 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
                     }
                 }
 
-                // 【修改】：把门槛降低回 0.1，让模型大胆一点
                 if (maxProb > 0.1f) {
                     val cxIndex = if (isChannelFirst) 0 * numBoxes + i else i * (4 + numClasses) + 0
                     val cyIndex = if (isChannelFirst) 1 * numBoxes + i else i * (4 + numClasses) + 1
@@ -163,7 +166,6 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
                 }
             }
 
-            // 把原始候选框数量和最终去重后的数量都打印出来，方便观察
             val debugStr = "去重前:${candidates.size} 去重后:${finalBoxes.size}"
 
             if (myHand.isEmpty() && finalBoxes.isEmpty()) {
@@ -204,4 +206,79 @@ class YoloCardRecognizer(private val context: Context) : CardRecognizer {
         floatBuffer.rewind()
         return floatBuffer
     }
+}
+
+class DouZeroEngine(private val context: Context) {
+    private val env = OrtEnvironment.getEnvironment()
+    private val sessions = mutableMapOf<Role, OrtSession>()
+
+    init {
+        listOf(
+            Role.LANDLORD to "landlord.onnx",
+            Role.LANDLORD_UP to "landlord_up.onnx",
+            Role.LANDLORD_DOWN to "landlord_down.onnx"
+        ).forEach { (role, name) ->
+            try {
+                val modelBytes = context.assets.open(name).readBytes()
+                sessions[role] = env.createSession(modelBytes, OrtSession.SessionOptions())
+            } catch (e: Exception) { }
+        }
+    }
+
+    fun hasModel(): Boolean = sessions.isNotEmpty()
+
+    fun infer(state: GameState): FloatArray {
+        val session = sessions[state.myRole] ?: return FloatArray(0)
+        return try {
+            val handTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(encodeHand(state.myHand)), longArrayOf(1, 4, 15))
+            val inputs = mapOf("hand_cards" to handTensor)
+            session.run(inputs).use { result -> (result.get(0) as OnnxTensor).floatBuffer.array() }
+        } catch (_: Exception) { FloatArray(0) }
+    }
+
+    private fun encodeHand(hand: List<Int>): FloatArray {
+        val flatArray = FloatArray(4 * 15) 
+        val counts = IntArray(15)
+        hand.forEach { if (it in 0..14) counts[it]++ }
+        for (v in 0 until 15) {
+            for (r in 0 until counts[v].coerceAtMost(4)) { flatArray[r * 15 + v] = 1f }
+        }
+        return flatArray
+    }
+
+    fun close() { sessions.values.forEach { it.close() }; env.close() }
+}
+
+object ActionDecoder {
+    data class Suggestion(val action: String, val cards: List<Int>)
+    fun suggest(state: GameState, qValues: FloatArray): Suggestion {
+        if (state.isLandlordTurnToCall) return decideCall(state.myHand)
+        if (state.isDoublingPhase) return decideDouble(state.myHand)
+        return decidePlay(state)
+    }
+    private fun decideCall(hand: List<Int>): Suggestion {
+        val s = handStrength(hand)
+        return when { s >= 8 -> Suggestion("抢地主", emptyList()); s >= 5 -> Suggestion("考虑抢地主", emptyList()); else -> Suggestion("不抢", emptyList()) }
+    }
+    private fun decideDouble(hand: List<Int>): Suggestion { return if (handStrength(hand) >= 7) Suggestion("加倍", emptyList()) else Suggestion("不加倍", emptyList()) }
+    private fun handStrength(hand: List<Int>): Int {
+        var score = 0
+        val counts = IntArray(15)
+        hand.forEach { if (it in 0..14) counts[it]++ }
+        if (counts[13] > 0) score += 3; if (counts[14] > 0) score += 4; score += counts[12] * 2
+        for (v in 0..12) if (counts[v] == 4) score += 5
+        return score
+    }
+    private fun decidePlay(state: GameState): Suggestion {
+        val hand = state.myHand.sorted()
+        if (hand.isEmpty()) return Suggestion("无牌可出", emptyList())
+        val lastMove = state.lastMoves.lastOrNull { it.isNotEmpty() }
+        if (lastMove == null) return Suggestion("出 ${cardName(hand.first())}", listOf(hand.first()))
+        if (lastMove.size == 1) {
+            val beat = hand.firstOrNull { it > lastMove[0] }
+            if (beat != null) return Suggestion("出 ${cardName(beat)}", listOf(beat))
+        }
+        return Suggestion("过牌", emptyList())
+    }
+    private fun cardName(v: Int): String = when (v) { 12 -> "2"; 13 -> "小王"; 14 -> "大王"; else -> listOf("3","4","5","6","7","8","9","10","J","Q","K")[v] }
 }
